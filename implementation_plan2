@@ -1,0 +1,122 @@
+# Admin System Architectural Audit & Fix Plan
+
+## Goal Description
+Conduct a rigorous, real-world business audit of the "RepairMyBike" Admin ecosystem, focusing on the true CRUD capabilities for Services, Spare Parts, and Subscriptions. The objective is to identify the "Truth Gap" between the frontend UI presentation and the actual backend data capabilities, ensuring the system is truly production-ready.
+
+---
+
+## STEP 1: UNDERSTAND ADMIN WORKFLOW (REAL WORLD)
+
+If I am a business admin managing a mechanic shop platform, I require absolute control over my catalog. 
+
+1. **Services**: I need to define the Name, Category, Rich Description, SEO tags, Pricing Tiers (by bike model), **Active/Inactive Status** (to hide seasonal services), Included Parts (Specs), and a **Gallery of Images** showing the service being performed.
+2. **Spare Parts**: I need to manage Inventory Qty, Name, Brand, Category, SKU, MRP, Sale Price, **Dimensions/Weight** (for shipping), **Warranty Details** (Months, Pro-Rata), Technical Specs, an **Active/Inactive Status**, and a **Multi-Image Gallery**.
+3. **Subscriptions**: I need to define the Plan Name, Banner/Hero Image, Tier (Basic/Premium), Duration (Billing Period), Price, Discount Price, a structured list of **Benefits**, a list of **Included Services**, and an **Active/Inactive Status**.
+
+---
+
+## STEP 2: MODEL vs REAL REQUIREMENT GAP
+
+| Domain | Model Analysis | Verdict |
+|--------|---------------|---------|
+| **Services** | ❌ Missing `active` (status) field. Admin cannot hide a service without deleting it! ⚠️ Has `images` as a single `ImageField`, but a service realistically requires a gallery (multiple images). | 🟡 **Weak** |
+| **Spare Parts** | ✅ Excellent model. Contains `sku`, `mrp`, `sale_price`, `stock_qty`, `warranty_months_total`, `active` flag, and a dedicated `SparePartImage` model for a robust image gallery. | 🟢 **Good** |
+| **Subscriptions** | ✅ Good fields. Has `price`, `discount_price`, `billing_period`, `active`, and `included_services` (M2M). ⚠️ Contains legacy JSON fields (`benefits` and `services`) alongside structured tables (`PlanBenefit`), which causes data duplication. | 🟢 **Good** |
+
+---
+
+## STEP 3: IMAGE / MEDIA HANDLING (CRITICAL)
+
+> [!CAUTION]
+> The biggest failure in the current architecture is Media Handling. While the database models technically have `ImageField` columns, the serializers and frontend forms completely ignore them.
+
+| Feature | Image Support (Models) | Image Support (API/UI) | Status |
+|--------|------------------------|------------------------|--------|
+| Services | YES (Single Image) | NO | 🔴 **MISSING** |
+| Spare Parts | YES (Gallery Model) | NO | 🔴 **MISSING** |
+| Subscription | YES (Hero Image) | NO | 🔴 **MISSING** |
+
+---
+
+## STEP 4: ADMIN CRUD REALITY CHECK
+
+👉 **VERDICT: FAKE CRUD**
+
+- **Services**: **FAKE**. Admin cannot upload images. Admin cannot edit technical specifications. Admin cannot control visibility (hide/show) because the field doesn't exist.
+- **Spare Parts**: **FAKE**. Admin can only edit Name, Category, Brand, Price, and Stock. Admin *cannot* edit descriptions, warranties, dimensions, or upload product images, despite the database supporting it.
+- **Subscriptions**: **FAKE**. Admin cannot upload plan images. Admin cannot assign included services. Benefits are completely read-only via the API, meaning admins cannot tell users what the plan actually includes.
+
+---
+
+## STEP 5: SERIALIZER AUDIT
+
+A deep dive into `admin_api/operations/serializers.py` reveals the bottleneck:
+
+- `AdminServiceSerializer`: `images` and `specifications` fields are entirely omitted from `Meta.fields`. 
+- `AdminInventorySerializer`: Omit critical business fields. Missing `description`, `warranty_months_total`, `weight_grams`, `length_mm`, etc. The nested `SparePartImage` serializer is entirely absent.
+- `AdminPlanSerializer`: Exposes `benefits` as `read_only=True` via a nested serializer, but provides no writable M2M mapping. Missing `image` and `included_services`.
+
+---
+
+## STEP 6: API CAPABILITY CHECK
+
+- **Methods**: The system uses `ModelViewSet`, so standard CRUD actions exist.
+- **Uploads**: Because the Serializers drop the image fields, the APIs inherently reject or ignore `multipart/form-data` uploads for images.
+- **Validation**: Basic validation exists, but business logic (like ensuring a Spare Part has at least one primary image) is missing.
+
+---
+
+## STEP 7: FRONTEND ADMIN UI CHECK
+
+- **Modals**: (`ServiceModal.tsx`, `PartModal.tsx`, `PlanModal.tsx`) are extremely basic.
+- **Image Upload**: There is absolutely **zero** UI for uploading or previewing images.
+- **Completeness**: The forms are simply 1:1 reflections of the weak serializers, omitting 60% of the actual database models.
+
+---
+
+## STEP 8: FINAL GAP REPORT
+
+### 🔴 Critical Missing Features
+- **Zero Image Upload**: Admins cannot upload media for any entity in the system.
+- **No Visibility Control for Services**: Deleting a service is the only way to hide it from the customer app.
+- **Read-Only Benefits**: Admins cannot define or edit the benefits of a subscription plan via the dashboard.
+
+### 🟡 Weak Design
+- **Service Images**: Services use a single `ImageField` instead of a dedicated gallery model like Spare Parts.
+- **Subscription Duplication**: Legacy JSON fields exist alongside relational tables.
+
+### 🟢 Good Parts
+- **Spare Parts Data Structure**: The `SparePart` model is extremely robust and production-ready, it just needs to be exposed properly.
+
+---
+
+## STEP 9: FIX PLAN (VERY IMPORTANT)
+
+### 1. Services Domain
+- **Model**: Add `active = models.BooleanField(default=True)` to `Service`. Consider creating a `ServiceImage` gallery model.
+- **Serializer**: Add `active`, `images`, and `specifications` to `AdminServiceSerializer`.
+- **UI**: Add an Image Dropzone to `ServiceModal.tsx`, an Active toggle switch, and a dynamic key-value input for Specs.
+
+### 2. Spare Parts Domain
+- **Model**: No changes needed.
+- **Serializer**: Expand `AdminInventorySerializer` to include all business fields (Warranty, Dimensions). Create a nested writable serializer for `SparePartImage`.
+- **UI**: Add an Image Dropzone gallery to `PartModal.tsx`, and expand the form to include tabs for "General", "Dimensions", and "Warranty".
+
+### 3. Subscriptions Domain
+- **Model**: Deprecate the legacy `benefits` JSON field in favor of the `PlanBenefit` model.
+- **Serializer**: Update `AdminPlanSerializer` to include the `image` field and support nested writes for `benefits_list` and `included_services`.
+- **UI**: Add an Image Dropzone, a multi-select for Included Services, and a dynamic list builder for Benefits.
+
+---
+
+## STEP 10: FINAL VERDICT
+
+👉 **Can admin FULLY manage Services, Spare Parts, and Subscriptions?**
+**NO.**
+
+**Current State**: **UI-heavy, Backend-limited, and Not production ready.**
+The dashboard looks great, but it is currently an illusion. It is a "Fake CRUD" system where the admin can only manage the absolute bare minimum (Name, Price, Stock). The system restricts the admin from running a real business due to massive gaps between the powerful database models and the heavily stripped-down API serializers and UI forms. 
+
+## User Review Required
+> [!WARNING]
+> Please review the Fix Plan in Step 9. Implementing these changes will require modifying Django Serializers to support `multipart/form-data` and building React Dropzone components in the Next.js frontend. Shall we proceed with executing Phase 1 of the Fix Plan (Services Domain)?

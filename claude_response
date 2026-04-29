@@ -1,0 +1,381 @@
+# CODE REVIEW REPORT — RepairMyBike
+**Date:** 2026-03-31
+**Reviewed by:** Claude Code (claude-sonnet-4-6)
+
+---
+
+## 1. PROJECT OVERVIEW
+
+**RepairMyBike** is a hyperlocal B2B + B2C service platform for two-wheeler (motorcycle/scooter) repairs and spare parts e-commerce. It includes:
+- Customer booking (home/shop visits, emergency quick service)
+- Spare parts e-commerce with cart/orders
+- Subscription plans (Basic/Premium, tiered visits)
+- Mechanic/staff management & assignment
+- Admin real-time operations dashboard
+- Payments via Razorpay, loyalty points, referral bonuses
+- Push notifications via Firebase FCM
+
+---
+
+## 2. FILE COUNT SUMMARY
+
+| Sub-Project | Tech | Source Files |
+|---|---|---|
+| `repairmybike_backend` | Django 5.2.7 + DRF | 213 `.py` files |
+| `repairmybike_frontend` | Flutter 3+ | 94 `.dart` files |
+| `repairmybike_admin` | Next.js 16 + React 19 | 25 `.tsx/.ts` files |
+| Root docs | Markdown | 6 `.md` files |
+| **Total (excl. node_modules/.next/.git)** | — | **~1,404 files** |
+
+---
+
+## 3. TECH STACK
+
+### Backend
+- Django 5.2.7 + DRF 3.16.1, Daphne (ASGI), Django Channels (WebSocket)
+- PostgreSQL (prod) / SQLite (dev), Redis, Celery 5.4.0, APScheduler
+- Auth: Descope OTP, Custom JWT/session, Guest auth
+- Payments: Razorpay 2.0.0
+- Storage: Cloudinary + django-storages
+- Notifications: Firebase Admin SDK 6.5.0
+- Security: django-cors-headers, cryptography, PyJWT
+
+### Frontend
+- Flutter, Provider 6.1.1 + Riverpod 3.0.3
+- GoRouter 14.7.2, Dio 5.9.0 (SecureApiClient with interceptors)
+- Firebase Messaging 15.1.3, flutter_local_notifications
+
+### Admin Dashboard
+- Next.js 16.2.1, React 19.2.4, TypeScript
+- Zustand 5.0.12, shadcn/ui, Tailwind CSS 4, Axios 1.14.0
+
+---
+
+## 4. ARCHITECTURE ASSESSMENT
+
+| Sub-Project | Score | Notes |
+|---|---|---|
+| Backend | 8/10 | Clean modular apps, signals, transactions, proper auth classes |
+| Frontend | 7.5/10 | Good separation, offline resilience, idempotency keys |
+| Admin | 7/10 | Modern stack, real-time store, but only 25 files — mostly placeholders |
+
+**Backend strengths:** DB indexing on hot fields, `transaction.atomic()` usage, signal-driven events, proper Celery async tasks, WebSocket live dashboard.
+**Frontend strengths:** Offline retry interceptor, idempotency headers, FCM deep linking, branded error UI.
+**Admin weaknesses:** Booking/Mechanics/Inventory/Reconciliation/Tickets pages are placeholders, no auth/session management.
+
+---
+
+## 5. CRITICAL BUGS (Must Fix Immediately)
+
+### BUG 1 — NameError in Bookings Signals
+- **File:** `repairmybike_backend/bookings/signals.py` lines 88, 99, 131, 148
+- **Issue:** References `User` and `LoyaltyTransaction` without importing them
+- **Impact:** Runtime crash when any booking completes — loyalty points & referral bonuses broken
+- **Fix:**
+  ```python
+  from authentication.models import User, LoyaltyTransaction
+  ```
+
+### BUG 2 — Undefined Logger in Bookings Views
+- **File:** `repairmybike_backend/bookings/views.py` line 60
+- **Issue:** `logger.error()` called but `logger` never defined
+- **Impact:** NameError crash when booking list fails
+- **Fix:**
+  ```python
+  import logging
+  logger = logging.getLogger(__name__)
+  ```
+
+---
+
+## 6. HIGH-PRIORITY ISSUES
+
+| # | Issue | File | Impact |
+|---|---|---|---|
+| 3 | DEBUG-mode `AllowAny` on 42 viewsets | `admin_api/operations/views.py` | Admin endpoints publicly exposed if DEBUG=True in prod |
+| 4 | `CORS_ALLOW_ALL_ORIGINS = True` | `settings.py` line 350 | Any domain can make authenticated requests |
+| 5 | Razorpay webhook — no HMAC signature validation | `payments/views.py` | Payments can be spoofed |
+| 6 | Referral bonus never triggers | `bookings/signals.py` | Checks `completed_count == 1` after increment (should be `== 0`) |
+| 7 | No test coverage | All sub-projects | Zero unit/integration tests → high regression risk |
+| 8 | WhatsApp integration incomplete | `notifications/utils.py` line 92 | `send_whatsapp_message()` called but not implemented — silent failure |
+| 9 | Idempotency key not enforced on booking creation | `bookings/views.py` | Duplicate network retries create duplicate bookings |
+| 10 | No subscription auto-renewal Celery task | — | Subscriptions expire silently |
+
+---
+
+## 7. RUNTIME ERRORS — Admin Dashboard (Debugged 2026-03-31)
+
+These errors were observed live in the browser console during testing of the `repairmybike_admin` Next.js dashboard.
+
+---
+
+### ERROR A — `inventory.filter is not a function`
+
+**File:** `repairmybike_admin/src/app/dashboard/inventory/page.tsx` line 55
+
+**Error message:**
+```
+Uncaught TypeError: inventory.filter is not a function
+    at InventoryPage (src/app/dashboard/inventory/page.tsx:55:25)
+```
+
+**Root Cause — Two-layer problem:**
+
+1. **DRF Global Pagination** (`settings.py` lines 334–335):
+   ```python
+   'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+   'PAGE_SIZE': 20,
+   ```
+   The `InventoryViewSet` list endpoint wraps the array in a paginated envelope:
+   ```json
+   { "count": 42, "next": null, "previous": null, "results": [...] }
+   ```
+   This is an **object**, not an array. Calling `.filter()` on it throws `TypeError`.
+
+2. **Axios Response Interceptor already unwraps `.data`** (`src/lib/api.ts` line 34):
+   ```ts
+   (response) => response.data  // interceptor returns response.data directly
+   ```
+   So `res` from any API call is already `response.data`. The original code `res.data || res` accessed `.data` on an already-unwrapped object → `undefined` → fell through to `res` (the paginated object) → crash.
+
+**Before (broken):**
+```ts
+const res: any = await operationsService.getInventory();
+setInventory(res.data || res);  // res.data is undefined; res is { count, results: [] }
+```
+
+**After (fixed):**
+```ts
+const res: any = await operationsService.getInventory();
+// Axios interceptor already unwraps response.data, so res IS response.data.
+// DRF pagination wraps arrays as: { count, next, previous, results: [...] }
+const data = res?.results ?? (Array.isArray(res) ? res : []);
+setInventory(data);
+```
+
+**Status:** ✅ Fixed
+
+---
+
+### ERROR B — `tickets.filter is not a function`
+
+**File:** `repairmybike_admin/src/app/dashboard/tickets/page.tsx` line 55
+
+**Error message:**
+```
+Uncaught TypeError: tickets.filter is not a function
+    at TicketsPage (src/app/dashboard/tickets/page.tsx:55:35)
+```
+
+**Root Cause:** Identical to Error A — same DRF pagination + same axios interceptor pattern.
+Additionally, the tickets page was even worse: it did `setTickets(res)` storing the full
+paginated object directly without even attempting to access `.results`.
+
+`ticketService.list()` calls `GET /api/staff/tickets/` → DRF returns paginated object → stored as-is.
+
+**Before (broken):**
+```ts
+const res: any = await ticketService.list();
+setTickets(res);  // res = { count, next, previous, results: [...] } — not an array!
+```
+
+**After (fixed):**
+```ts
+const res: any = await ticketService.list();
+// Axios interceptor already unwraps response.data, so res IS response.data.
+// DRF pagination wraps arrays as: { count, next, previous, results: [...] }
+const data = res?.results ?? (Array.isArray(res) ? res : []);
+setTickets(data);
+```
+
+**Status:** ✅ Fixed
+
+---
+
+### ERROR C — SSE Connection Error (infinite retry loop)
+
+**File:** `repairmybike_admin/src/hooks/useDashboardStream.ts` lines 112–118
+
+**Error message (repeating every ~5 seconds):**
+```
+SSE Connection Error: [object Event]
+    at useDashboardStream.useEffect.connect (src/hooks/useDashboardStream.ts:112:17)
+```
+
+**Root Causes — Three compounding problems:**
+
+#### Cause 1: Wrong URL (Fixed)
+The hook connected to `/api/dashboard/stream/` but `urls.py` mounts the dashboard app at `dashboard/` (no `api/` prefix):
+```python
+# repairmybike/urls.py line 10
+path('dashboard/', include('dashboard.urls')),  # NOT /api/dashboard/
+```
+The correct URL is `/dashboard/stream/`.
+
+**Before:** `const sseUrl = \`${API_BASE_URL}/api/dashboard/stream/\``
+**After:** `const sseUrl = \`${API_BASE_URL}/dashboard/stream/\``
+
+#### Cause 2: EventSource Cannot Send JWT Auth Headers (Root Cause — Still Active)
+The admin uses **JWT Bearer tokens** stored in `localStorage`, attached via Axios interceptor:
+```ts
+// src/lib/api.ts line 16
+config.headers['Authorization'] = `Bearer ${token}`;
+```
+
+However, the browser's native `EventSource` API **cannot send custom HTTP headers**. It only supports cookies (`withCredentials: true`). The SSE endpoint requires `IsAuthenticated + IsStaffAuthenticated`:
+```python
+# dashboard/sse_views.py line 13
+@permission_classes([IsAuthenticated, IsStaffAuthenticated])
+def dashboard_stream(request):
+```
+Every SSE connection arrives with **no auth header** → DRF returns 403 Forbidden → EventSource fires `onerror` → hook closes and retries after 5 seconds → infinite loop.
+
+#### Cause 3: @api_view Wrapping Conflicts with StreamingHttpResponse
+`@api_view(['GET'])` buffers the DRF request cycle in ways that interfere with streaming. SSE requires a raw Django view returning `StreamingHttpResponse` directly, not wrapped in DRF's request/response cycle.
+
+**Fix Required (not yet applied — architectural change needed):**
+
+**Option A — Token in URL query param (quick fix):**
+```ts
+// frontend: pass token as query param
+const token = JSON.parse(localStorage.getItem('rmb-admin-auth') || '{}')?.state?.token;
+const sseUrl = `${API_BASE_URL}/dashboard/stream/?token=${token}`;
+```
+```python
+# backend: read token from query param
+def dashboard_stream(request):
+    token = request.GET.get('token')
+    # validate token manually, then stream
+```
+⚠️ Security note: tokens in URLs appear in server logs. Use short-lived tokens only.
+
+**Option B — Next.js API Route Proxy (recommended):**
+Create `src/app/api/stream/route.ts` that reads the JWT from cookies/localStorage server-side and proxies the SSE request to Django with the proper `Authorization` header. The browser connects to `/api/stream` (same-origin, no CORS) and Next.js forwards it authenticated.
+
+**Option C — Cookie-based auth for SSE only:**
+On login, set an `HttpOnly` cookie in addition to localStorage. `EventSource` with `withCredentials: true` will send it automatically.
+
+**Status:** ⚠️ Partially fixed (URL corrected). Auth issue requires architectural decision.
+
+---
+
+## 8. PATTERN: DRF Pagination Breaking Frontend
+
+This is a **systemic pattern** — every page that fetches a DRF list endpoint will hit this bug unless fixed. The root cause is that global `PageNumberPagination` is enabled in settings but the frontend was written assuming bare array responses.
+
+**All pages that need the same fix:**
+
+| Page | File | API Call | Fixed? |
+|---|---|---|---|
+| Inventory | `dashboard/inventory/page.tsx` | `operationsService.getInventory()` | ✅ |
+| Tickets | `dashboard/tickets/page.tsx` | `ticketService.list()` | ✅ |
+| Bookings | `dashboard/bookings/page.tsx` | `operationsService.getBookings()` | ⚠️ Check |
+| Mechanics | `dashboard/mechanics/page.tsx` | `operationsService.getMechanics()` | ⚠️ Check |
+| Reconciliation | `dashboard/reconciliation/page.tsx` | `operationsService.getReconciliationList()` | ⚠️ Check |
+
+**Fix pattern to apply everywhere:**
+```ts
+const res: any = await someService.getList();
+// res IS response.data (axios interceptor unwraps it)
+// DRF paginates as { count, next, previous, results: [...] }
+const data = res?.results ?? (Array.isArray(res) ? res : []);
+setState(data);
+```
+
+**Alternative — Disable pagination for admin endpoints** (simpler):
+```python
+# In each admin ViewSet:
+pagination_class = None
+```
+This makes them return bare arrays, removing the need for frontend unpacking.
+
+---
+
+## 9. COMPLETENESS ASSESSMENT
+
+### Implemented (MVP-Ready)
+- Authentication (Descope OTP + custom auth)
+- Vehicle catalog (Type → Brand → Model)
+- Service bookings with full status flow
+- Spare parts e-commerce (cart, orders)
+- Subscription plans (multiple billing periods)
+- Payment capture (Razorpay order creation)
+- FCM push notifications
+- Loyalty points system
+- Referral bonuses
+- Admin real-time dashboard (WebSocket metrics, live feed)
+- Staff assignment modal
+- Quick/emergency service requests
+- Reviews & ratings
+
+### Partially Implemented
+- Razorpay webhooks (order creation works; signature verification missing)
+- WhatsApp alerts (code present; integration incomplete)
+- Admin dashboard pages (overview complete; others are placeholders)
+- SSE real-time stream (endpoint exists; auth not compatible with EventSource)
+
+### Planned but Missing
+- Subscription auto-renewal Celery task
+- Refund processing endpoint
+- Inventory low-stock alerts
+- Customer complaint/ticket system
+- Promo codes / coupon system (models exist, no UI)
+- Multi-location/franchise support
+- Mechanic live GPS tracking
+- CRM tagging & segmentation
+- Customer LTV analytics
+
+---
+
+## 10. RECOMMENDATIONS (Priority Order)
+
+### Phase 1 — Fix Critical Bugs (Days 1–3)
+1. Add missing imports in `bookings/signals.py`
+2. Add logger to `bookings/views.py`
+3. Remove DEBUG-mode AllowAny — enforce auth always
+4. Validate Razorpay webhook HMAC signatures
+5. Fix referral bonus trigger condition (`== 0` not `== 1`)
+
+### Phase 2 — Admin Dashboard Runtime Fixes (Days 4–5)
+6. ✅ Fix `inventory.filter` crash — extract `res.results` (done)
+7. ✅ Fix `tickets.filter` crash — extract `res.results` (done)
+8. Audit and fix Bookings, Mechanics, Reconciliation pages for same pattern
+9. Fix SSE auth — implement one of the three options in Error C above
+10. Fix SSE `@api_view` conflict — convert to plain Django view for streaming
+
+### Phase 3 — Security & Data Integrity (Days 6–10)
+11. Restrict CORS — replace `CORS_ALLOW_ALL_ORIGINS` with explicit allowed domains
+12. Enforce idempotency key uniqueness on booking creation
+13. Add API rate limiting (per-IP throttling)
+14. Replace print statements with structured logging
+15. Add admin audit trail (log assignments, status changes)
+
+### Phase 4 — Complete Core Features (Weeks 2–3)
+16. Implement subscription auto-renewal Celery Beat task
+17. Build refund API endpoint (Razorpay refund integration)
+18. Complete WhatsApp integration (Twilio or MSG91)
+19. Add inventory low-stock alert background task
+
+### Phase 5 — Testing (Ongoing)
+20. Pytest suite for models, views, signals (target 60%+ coverage)
+21. Integration tests for booking → payment → completion flow
+22. Load testing for WebSocket dashboard concurrency
+23. Security penetration test before production launch
+
+---
+
+## 11. SUMMARY SCORECARD
+
+| Metric | Value | Status |
+|---|---|---|
+| Backend source files | 213 `.py` | Healthy |
+| Frontend source files | 94 `.dart` | Comprehensive |
+| Admin source files | 25 `.tsx` | Underdeveloped |
+| Critical runtime bugs | 2 | HIGH RISK |
+| Admin dashboard errors found | 3 (A, B, C) | 2 Fixed, 1 Partial |
+| Security issues | 3 | MEDIUM RISK |
+| Test coverage | ~0% | CRITICAL GAP |
+| Documentation quality | Excellent (6 `.md` docs) | GOOD |
+| Deployment readiness | ~70% | PARTIAL |
+
+**Overall Assessment:** Solid architecture and business logic foundation. Not production-ready due to critical import bugs, security gaps, missing core workflows, and zero test coverage. Admin dashboard has a systemic DRF pagination issue across all list pages. With focused effort on Phase 1 & 2 items, deployment-ready in **2–3 weeks**.
